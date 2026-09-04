@@ -24,7 +24,7 @@ jobs:
           pytest -q --noconftest \
             tests/test_dedupe.py \
             tests/test_scoring.py \
-            tests/test_website_intelligence.py \
+            backend/tests/test_website_intelligence.py \
             tests/test_esp_unsubscribe.py \
             tests/test_plan_limits.py \
             tests/test_logging.py \

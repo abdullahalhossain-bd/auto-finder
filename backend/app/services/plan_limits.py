@@ -14,6 +14,22 @@ PLAN_CAPS = {
     "pro": {"max_campaigns_per_month": 50, "max_leads_per_month": 5000},
 }
 
+SCORE_TIERS = (
+    (80, "hot", "Hot Opportunity"),
+    (60, "warm", "Warm Opportunity"),
+    (40, "qualified", "Qualified Opportunity"),
+    (0, "low", "Low Opportunity"),
+)
+
+
+def score_tier(score: float) -> dict:
+    """Return a stable presentation tier for a deterministic opportunity score."""
+    value = max(0.0, min(float(score), 100.0))
+    for threshold, tier, label in SCORE_TIERS:
+        if value >= threshold:
+            return {"tier": tier, "label": label}
+    return {"tier": "low", "label": "Low Opportunity"}
+
 
 class PlanLimitExceeded(Exception):
     def __init__(self, code: str, message: str) -> None:
@@ -42,7 +58,6 @@ async def assert_subscription_allows_writes(session, organization_id: UUID) -> N
     )
     sub = result.scalar_one_or_none()
     if sub is None:
-        # Legacy orgs without a row — allow with trial caps only
         return
 
     if sub.status in ("past_due", "cancelled"):
@@ -135,17 +150,12 @@ async def assert_lead_capacity(session, organization_id: UUID, additional: int =
 
 
 async def assert_can_send_outbound(session, organization_id: UUID) -> None:
-    """
-    Gate outbound email (approve + worker).
-    Blocks past_due / cancelled / expired trial — same rules as campaign writes.
-    """
     await assert_subscription_allows_writes(session, organization_id)
 
 
 def assert_can_send_outbound_sync(session, organization_id: UUID) -> None:
     """Sync variant for Celery worker / outreach_service."""
     from sqlalchemy import select
-    from datetime import datetime, timezone
 
     from app.models.subscription import Subscription
 

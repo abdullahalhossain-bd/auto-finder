@@ -2,7 +2,7 @@
 Sync discovery pipeline for Celery workers.
 
 OSM seed → optional Google Places enrichment → strong dedupe →
-website audit (bounded) → score → Lead create.
+website intelligence audit (bounded) → score → Lead create.
 
 Never called from a FastAPI request path — only from workers.
 """
@@ -29,49 +29,17 @@ from app.services.places_provider import (
     match_places_to_osm,
 )
 from app.services.scoring_service import ScoringService
+from app.services.website_intelligence import analyze_website_sync
 
 logger = logging.getLogger(__name__)
 
 MAX_WEBSITE_AUDITS_PER_RUN = 25
+WEBSITE_RECrawl_DAYS = 30
 
 
 def _analyze_website_sync(url: str) -> Dict[str, Any]:
-    from bs4 import BeautifulSoup
-
-    from app.core.config import get_settings
-    from app.security.safe_fetch import SafeFetchError, safe_fetch
-
-    settings = get_settings()
-    result: Dict[str, Any] = {
-        "http_status": None,
-        "has_ssl": None,
-        "has_viewport": None,
-        "booking_vendor_detected": None,
-        "raw_findings": {},
-    }
-    known = ("calendly", "square.site", "squareup", "setmore", "booksy", "fresha", "mindbody")
-    try:
-        resp = safe_fetch(
-            url,
-            timeout=float(getattr(settings, "WEBSITE_FETCH_TIMEOUT_SECONDS", 10)),
-            max_bytes=int(getattr(settings, "WEBSITE_FETCH_MAX_BYTES", 5_242_880)),
-        )
-        result["http_status"] = resp.status_code
-        result["has_ssl"] = str(resp.url).startswith("https://")
-        text = resp.text[: int(getattr(settings, "WEBSITE_FETCH_MAX_BYTES", 5_242_880))]
-        soup = BeautifulSoup(text, "html.parser")
-        result["has_viewport"] = soup.find("meta", attrs={"name": "viewport"}) is not None
-        lower = text.lower()
-        for vendor in known:
-            if vendor in lower:
-                result["booking_vendor_detected"] = vendor
-                break
-        result["raw_findings"] = {"title": soup.title.string if soup.title else None}
-    except SafeFetchError as exc:
-        result["raw_findings"] = {"error": f"{exc.code}: {exc.message}", "ssrf_blocked": True}
-    except Exception as exc:
-        result["raw_findings"] = {"error": str(exc)[:300]}
-    return result
+    """Backward-compatible wrapper around the richer deterministic analyzer."""
+    return analyze_website_sync(url)
 
 
 def _collect_candidates(
@@ -86,8 +54,6 @@ def _collect_candidates(
     from app.demo.adapters import is_demo_mode
 
     if is_demo_mode():
-        # DEMO_MODE: never touch OSM/Overpass or Google Places over the
-        # network — build candidates from the local fixture catalog only.
         return _demo_candidates(city=city, business_type=business_type, limit=limit)
 
     discovery = DiscoveryService()
@@ -98,7 +64,6 @@ def _collect_candidates(
         limit=limit,
     )
     if osm and isinstance(osm[0], dict) and "error" in osm[0]:
-        # Still try Places-only if key available (sparse OSM regions)
         osm_err = osm[0]["error"]
         logger.warning("OSM discovery error: %s — trying Places-only if enabled", osm_err)
         osm = []
@@ -144,11 +109,7 @@ def _demo_candidates(
     business_type: Optional[str],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """
-    DEMO_MODE candidate source — local fixtures only, no network calls.
-    Shaped to match the OSM/Places candidate dict contract expected by
-    _upsert_business() and the scoring/audit steps below.
-    """
+    """DEMO_MODE candidate source — local fixtures only, no network calls."""
     from app.demo.fixtures import filter_demo_businesses
 
     demo_rows = filter_demo_businesses(industry=business_type, city=city, limit=limit)
@@ -174,8 +135,6 @@ def _demo_candidates(
                     "phone": "likely",
                     "website": "likely" if row.get("website_url") else "unknown",
                 },
-                # Carried through so the audit step below can skip any real
-                # network fetch and use these deterministic fixture flags.
                 "_demo_website_weak": bool(row.get("website_weak")),
                 "_demo_has_booking": bool(row.get("has_booking")),
             }
@@ -189,10 +148,7 @@ def _upsert_business(
     organization_id: UUID,
     raw: Dict[str, Any],
 ) -> Business:
-    """
-    Insert business or return existing row for same org+dedupe_key.
-    On conflict, enrich empty fields (phone/website/reviews) from the new payload.
-    """
+    """Insert business or return existing row for same org+dedupe_key."""
     key = raw.get("dedupe_key") or compute_dedupe_key(
         raw.get("name"),
         raw.get("latitude"),
@@ -261,21 +217,13 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     business_type = params.get("business_type") or params.get("category")
     country = params.get("country")
     limit = int(params.get("limit") or 50)
-    # Optional per-campaign Places key (otherwise platform settings)
     places_key = params.get("google_places_api_key")
 
     if not city or not business_type:
-        # Defense-in-depth only: the API (`POST /campaigns/{id}/start`) already
-        # validates this before a job is ever enqueued, so a normal user
-        # should never hit this branch. It stays here in case this pipeline
-        # is invoked from another path (e.g. the inline Celery-unavailable
-        # fallback in CampaignService.run_discovery, or a retried task).
         field_values = {"city": city, "business_type": business_type}
         missing_fields = [f for f in ("city", "business_type") if not field_values[f]]
         message = f"Missing required parameter(s): {', '.join(missing_fields)}"
-        logger.warning(
-            "discovery.validation_failed campaign=%s missing=%s", campaign_id, missing_fields
-        )
+        logger.warning("discovery.validation_failed campaign=%s missing=%s", campaign_id, missing_fields)
         campaign.status = "failed"
         session.commit()
         return {
@@ -312,7 +260,6 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
             "status": campaign.status,
         }
 
-    # Existing leads in this campaign (retry safety)
     existing_lead_biz = {
         row[0]
         for row in session.execute(
@@ -325,13 +272,11 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     created_leads = 0
     audited = 0
     total_found = len(candidates)
-
     campaign.status = "scoring"
     session.commit()
 
     for raw in candidates:
         if campaign.status == "cancelled":
-            # Re-read in case cancel raced (best-effort)
             session.refresh(campaign)
             if campaign.status == "cancelled":
                 break
@@ -345,7 +290,6 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         if business.id in existing_lead_biz:
             continue
 
-        # Contacts
         if raw.get("phone"):
             exists_phone = session.execute(
                 select(Contact.id).where(
@@ -369,12 +313,18 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         website_url = business.website_url or raw.get("website_url")
         website_weak = False
         has_booking = False
+        website_intelligence: Dict[str, Any] = {}
 
         if has_website and website_url and raw.get("_demo_website_weak") is not None:
-            # DEMO_MODE: never fetch the (fake) demo website URL over the
-            # network — use the deterministic fixture flags instead.
             website_weak = bool(raw.get("_demo_website_weak"))
             has_booking = bool(raw.get("_demo_has_booking"))
+            website_intelligence = {
+                "schema_version": 2,
+                "demo_mode": True,
+                "quality_score": 40 if website_weak else 85,
+                "weak_reasons": ["fixture_weak_website"] if website_weak else [],
+                "booking_vendor": "demo_booking" if has_booking else None,
+            }
             session.add(
                 WebsiteAudit(
                     business_id=business.id,
@@ -383,29 +333,46 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
                     has_ssl=website_url.startswith("https://"),
                     has_viewport=not website_weak,
                     booking_vendor_detected="demo_booking" if has_booking else None,
-                    raw_findings={"demo_mode": True, "note": "Simulated — no website fetched"},
+                    raw_findings=website_intelligence,
                     crawled_at=datetime.now(timezone.utc),
-                    next_recrawl_at=datetime.now(timezone.utc) + timedelta(days=30),
+                    next_recrawl_at=datetime.now(timezone.utc) + timedelta(days=WEBSITE_RECrawl_DAYS),
                 )
             )
-        elif has_website and website_url and audited < MAX_WEBSITE_AUDITS_PER_RUN:
-            # Skip re-audit if recent audit exists
+        elif has_website and website_url:
+            now = datetime.now(timezone.utc)
             prior = session.execute(
                 select(WebsiteAudit)
                 .where(WebsiteAudit.business_id == business.id)
                 .order_by(WebsiteAudit.crawled_at.desc().nullslast())
                 .limit(1)
             ).scalar_one_or_none()
-            if prior and prior.has_ssl is not None:
+
+            # Reuse a successful recent audit. Failed audits are eligible for
+            # retry so transient DNS/HTTP errors do not permanently poison a lead.
+            recent = bool(prior and prior.next_recrawl_at and prior.next_recrawl_at > now)
+            if prior and recent:
                 has_booking = bool(prior.booking_vendor_detected)
-                if not prior.has_ssl or not prior.has_viewport:
-                    website_weak = True
-            else:
+                website_intelligence = prior.raw_findings if isinstance(prior.raw_findings, dict) else {}
+                website_weak = bool(
+                    website_intelligence.get("weak_reasons")
+                    or prior.has_ssl is False
+                    or prior.has_viewport is False
+                    or (website_intelligence.get("quality_score") is not None and int(website_intelligence["quality_score"]) < 60)
+                )
+            elif audited < MAX_WEBSITE_AUDITS_PER_RUN:
                 audit_data = _analyze_website_sync(website_url)
                 audited += 1
                 has_booking = bool(audit_data.get("booking_vendor_detected"))
-                if not audit_data.get("has_ssl") or not audit_data.get("has_viewport"):
-                    website_weak = True
+                website_intelligence = audit_data.get("raw_findings") or {}
+                quality_score = website_intelligence.get("quality_score")
+                weak_reasons = website_intelligence.get("weak_reasons") or []
+                website_weak = bool(
+                    weak_reasons
+                    or audit_data.get("has_ssl") is False
+                    or audit_data.get("has_viewport") is False
+                    or (quality_score is not None and int(quality_score) < 60)
+                )
+                crawl_time = now
                 session.add(
                     WebsiteAudit(
                         business_id=business.id,
@@ -414,11 +381,15 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
                         has_ssl=audit_data.get("has_ssl"),
                         has_viewport=audit_data.get("has_viewport"),
                         booking_vendor_detected=audit_data.get("booking_vendor_detected"),
-                        raw_findings=audit_data.get("raw_findings"),
-                        crawled_at=datetime.now(timezone.utc),
-                        next_recrawl_at=datetime.now(timezone.utc) + timedelta(days=30),
+                        raw_findings=website_intelligence,
+                        crawled_at=crawl_time,
+                        next_recrawl_at=crawl_time + timedelta(days=WEBSITE_RECrawl_DAYS),
                     )
                 )
+            else:
+                # Audit budget exhausted: do not fabricate intelligence.
+                # Existing lead scoring can continue using the evidence we have.
+                logger.info("website audit budget exhausted campaign=%s", campaign_id)
 
         if filters.get("no_website") and has_website and not website_weak:
             continue
@@ -437,12 +408,10 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
             confidence=raw.get("confidence") or {},
         )
 
-        # Enforce monthly lead quota (Free: 40) — stop creating beyond remaining
         try:
             from app.services.plan_limits import PlanLimitExceeded
             from sqlalchemy import func, select as sa_select
             from app.models.campaign import Campaign as CampModel
-            from datetime import datetime, timezone
             since = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             used = session.execute(
                 sa_select(func.count())
@@ -456,13 +425,13 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
             from app.models.organization import Organization
             org = session.get(Organization, campaign.organization_id)
             from app.services.plan_limits import get_plan_caps, normalize_plan
-            limit = int(get_plan_caps(normalize_plan(org.plan if org else "free"))["max_leads_per_month"])
-            if int(used) + created_leads >= limit:
+            plan_limit = int(get_plan_caps(normalize_plan(org.plan if org else "free"))["max_leads_per_month"])
+            if int(used) + created_leads >= plan_limit:
                 logger.info(
                     "Lead quota reached org=%s used=%s limit=%s — stopping discovery inserts",
                     campaign.organization_id,
                     used,
-                    limit,
+                    plan_limit,
                 )
                 break
         except Exception as qexc:
@@ -474,6 +443,9 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
             opportunity_score=score_result["opportunity_score"],
             score_breakdown={
                 "rules": score_result["breakdown"],
+                "website_intelligence": website_intelligence,
+                "website_weak": website_weak,
+                "has_booking": has_booking,
                 "review_count_used": review_count,
                 "data_sources": list(
                     {

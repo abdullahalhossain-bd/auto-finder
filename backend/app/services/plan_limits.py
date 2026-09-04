@@ -4,12 +4,13 @@ Plan / trial volume caps + subscription status enforcement
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
 PLAN_CAPS = {
-    "trial": {"max_campaigns_per_month": 1, "max_leads_per_month": 25},
+    # Free/trial lead quota is a rolling 24-hour window. Campaign cap remains monthly.
+    "trial": {"max_campaigns_per_month": 1, "max_leads_per_month": 25, "max_leads_per_24h": 25},
     "starter": {"max_campaigns_per_month": 10, "max_leads_per_month": 500},
     "pro": {"max_campaigns_per_month": 50, "max_leads_per_month": 5000},
 }
@@ -53,6 +54,10 @@ def get_plan_caps(plan: Optional[str]) -> dict:
 def _month_start() -> datetime:
     now = datetime.now(timezone.utc)
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _trial_window_start() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=24)
 
 
 async def assert_subscription_allows_writes(session, organization_id: UUID) -> None:
@@ -124,6 +129,26 @@ async def assert_lead_capacity(session, organization_id: UUID, additional: int =
         raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
     plan = normalize_plan(org.plan)
     caps = get_plan_caps(plan)
+
+    if plan == "trial":
+        # Free/trial quota is a rolling 24-hour window, not a calendar/month boundary.
+        since = _trial_window_start()
+        count = (
+            await session.execute(
+                select(func.count()).select_from(Lead).join(Campaign, Lead.campaign_id == Campaign.id).where(
+                    Campaign.organization_id == organization_id,
+                    Lead.created_at >= since,
+                )
+            )
+        ).scalar_one()
+        cap = int(caps["max_leads_per_24h"])
+        if int(count) + additional > cap:
+            raise PlanLimitExceeded(
+                "LEAD_CAP_REACHED",
+                f"Your free plan allows {cap} leads every 24 hours. Please wait until your rolling 24-hour quota resets or upgrade.",
+            )
+        return
+
     since = _month_start()
     count = (
         await session.execute(

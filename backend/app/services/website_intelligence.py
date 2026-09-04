@@ -90,7 +90,9 @@ def analyze_website_sync(url: str) -> Dict[str, Any]:
         links = [a.get("href") for a in soup.find_all("a", href=True)]
         text_content = soup.get_text(" ", strip=True)
         emails = sorted(set(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, re.I)))[:10]
-        tel_links = sorted(set(a[7:] for a in links if isinstance(a, str) and a.lower().startswith("tel:")))[:10]
+        # Strip only the `tel:` URI scheme; preserve the full phone number,
+        # including its leading `+` country code.
+        tel_links = sorted(set(a[4:] for a in links if isinstance(a, str) and a.lower().startswith("tel:")))[:10]
         social_links = sorted({
             href for href in links
             if isinstance(href, str) and any(host in href.lower() for host in SOCIAL_HOSTS)

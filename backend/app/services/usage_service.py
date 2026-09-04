@@ -2,6 +2,8 @@
 Monthly usage counters write-path (usage table).
 
 Free stack only — Postgres row upsert, no paid analytics.
+Lead quota is enforced again at this write boundary so discovery workers
+cannot commit more leads than the organization's plan allows.
 """
 from __future__ import annotations
 
@@ -15,6 +17,8 @@ from sqlalchemy.orm import Session
 
 from app.core.logging_config import get_logger
 from app.models.usage import Usage
+from app.models.organization import Organization
+from app.services.plan_limits import PlanLimitExceeded, get_plan_caps, normalize_plan
 
 logger = get_logger(__name__)
 
@@ -33,6 +37,46 @@ def current_period(now: Optional[datetime] = None) -> str:
 
 def _bump(row: Usage, counter: CounterName, amount: int) -> None:
     setattr(row, counter, int(getattr(row, counter) or 0) + amount)
+
+
+def _assert_lead_increment_allowed_sync(
+    session: Session,
+    organization_id: UUID,
+    current_count: int,
+    amount: int,
+) -> None:
+    if amount <= 0:
+        return
+    org = session.get(Organization, organization_id)
+    if org is None:
+        raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
+    plan = normalize_plan(org.plan)
+    cap = int(get_plan_caps(plan)["max_leads_per_month"])
+    if current_count + amount > cap:
+        raise PlanLimitExceeded(
+            "LEAD_CAP_REACHED",
+            f"Your {plan} plan allows {cap} leads per month.",
+        )
+
+
+async def _assert_lead_increment_allowed_async(
+    session: AsyncSession,
+    organization_id: UUID,
+    current_count: int,
+    amount: int,
+) -> None:
+    if amount <= 0:
+        return
+    org = await session.get(Organization, organization_id)
+    if org is None:
+        raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
+    plan = normalize_plan(org.plan)
+    cap = int(get_plan_caps(plan)["max_leads_per_month"])
+    if current_count + amount > cap:
+        raise PlanLimitExceeded(
+            "LEAD_CAP_REACHED",
+            f"Your {plan} plan allows {cap} leads per month.",
+        )
 
 
 async def increment_usage_async(
@@ -64,6 +108,10 @@ async def increment_usage_async(
         )
         session.add(row)
         await session.flush()
+    if counter == "leads_count":
+        await _assert_lead_increment_allowed_async(
+            session, organization_id, int(row.leads_count or 0), amount
+        )
     _bump(row, counter, amount)
     await session.flush()
 
@@ -100,6 +148,10 @@ def increment_usage_sync(
         )
         session.add(row)
         session.flush()
+    if counter == "leads_count":
+        _assert_lead_increment_allowed_sync(
+            session, organization_id, int(row.leads_count or 0), amount
+        )
     _bump(row, counter, amount)
     session.flush()
 

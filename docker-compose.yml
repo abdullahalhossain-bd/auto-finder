@@ -1,0 +1,98 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ai_sales
+      POSTGRES_PASSWORD: ai_sales
+      POSTGRES_DB: ai_sales_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_sales -d ai_sales_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ai_sales:ai_sales@db:5432/ai_sales_agent
+      DATABASE_URL_TEST: postgresql+asyncpg://ai_sales:ai_sales@db:5432/ai_sales_agent_test
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      APP_ENV: development
+      ESP_PROVIDER: console
+      RATE_LIMIT_ENABLED: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: celery -A app.core.celery_app.celery_app worker -l info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ai_sales:ai_sales@db:5432/ai_sales_agent
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      APP_ENV: development
+      ESP_PROVIDER: console
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: celery -A app.core.celery_app.celery_app beat -l info
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ai_sales:ai_sales@db:5432/ai_sales_agent
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      APP_ENV: development
+    depends_on:
+      - redis
+      - worker
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

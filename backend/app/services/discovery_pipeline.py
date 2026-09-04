@@ -347,8 +347,6 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
                 .limit(1)
             ).scalar_one_or_none()
 
-            # Reuse a successful recent audit. Failed audits are eligible for
-            # retry so transient DNS/HTTP errors do not permanently poison a lead.
             recent = bool(prior and prior.next_recrawl_at and prior.next_recrawl_at > now)
             if prior and recent:
                 has_booking = bool(prior.booking_vendor_detected)
@@ -367,10 +365,8 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
                 quality_score = website_intelligence.get("quality_score")
                 weak_reasons = website_intelligence.get("weak_reasons") or []
                 website_weak = bool(
-                    weak_reasons
-                    or audit_data.get("has_ssl") is False
-                    or audit_data.get("has_viewport") is False
-                    or (quality_score is not None and int(quality_score) < 60)
+                    (quality_score is not None and int(quality_score) < 60)
+                    or audit_data.get("has_ssl") is False and audit_data.get("has_viewport") is False
                 )
                 crawl_time = now
                 session.add(
@@ -387,8 +383,6 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
                     )
                 )
             else:
-                # Audit budget exhausted: do not fabricate intelligence.
-                # Existing lead scoring can continue using the evidence we have.
                 logger.info("website audit budget exhausted campaign=%s", campaign_id)
 
         if filters.get("no_website") and has_website and not website_weak:
@@ -408,35 +402,6 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
             confidence=raw.get("confidence") or {},
         )
 
-        try:
-            from app.services.plan_limits import PlanLimitExceeded
-            from sqlalchemy import func, select as sa_select
-            from app.models.campaign import Campaign as CampModel
-            since = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            used = session.execute(
-                sa_select(func.count())
-                .select_from(Lead)
-                .join(CampModel, Lead.campaign_id == CampModel.id)
-                .where(
-                    CampModel.organization_id == campaign.organization_id,
-                    Lead.created_at >= since,
-                )
-            ).scalar_one()
-            from app.models.organization import Organization
-            org = session.get(Organization, campaign.organization_id)
-            from app.services.plan_limits import get_plan_caps, normalize_plan
-            plan_limit = int(get_plan_caps(normalize_plan(org.plan if org else "free"))["max_leads_per_month"])
-            if int(used) + created_leads >= plan_limit:
-                logger.info(
-                    "Lead quota reached org=%s used=%s limit=%s — stopping discovery inserts",
-                    campaign.organization_id,
-                    used,
-                    plan_limit,
-                )
-                break
-        except Exception as qexc:
-            logger.warning("quota check soft-fail: %s", qexc)
-
         lead = Lead(
             campaign_id=campaign.id,
             business_id=business.id,
@@ -449,15 +414,8 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
                 "review_count_used": review_count,
                 "data_sources": list(
                     {
-                        *(
-                            [raw.get("source") or (raw.get("source_data") or {}).get("source") or "osm"]
-                        ),
-                        *(
-                            ["google_places"]
-                            if (raw.get("source_data") or {}).get("enriched_from") == "google_places"
-                            or raw.get("source") == "google_places"
-                            else []
-                        ),
+                        raw.get("source") or (raw.get("source_data") or {}).get("source") or "osm",
+                        *(["google_places"] if (raw.get("source_data") or {}).get("enriched_from") == "google_places" or raw.get("source") == "google_places" else []),
                     }
                 ),
             },

@@ -30,6 +30,7 @@ from app.services.places_provider import (
 )
 from app.services.scoring_service import ScoringService
 from app.services.website_intelligence import analyze_website_sync
+from app.services.usage_service import get_remaining_lead_capacity_sync
 
 logger = logging.getLogger(__name__)
 
@@ -272,10 +273,25 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     created_leads = 0
     audited = 0
     total_found = len(candidates)
+    quota_reached = False
+    remaining_lead_capacity = get_remaining_lead_capacity_sync(
+        session,
+        campaign.organization_id,
+    )
     campaign.status = "scoring"
     session.commit()
 
+    if remaining_lead_capacity <= 0:
+        quota_reached = True
+        logger.info(
+            "Discovery skipped: monthly lead quota already reached campaign=%s",
+            campaign_id,
+        )
+
     for raw in candidates:
+        if quota_reached:
+            break
+
         if campaign.status == "cancelled":
             session.refresh(campaign)
             if campaign.status == "cancelled":
@@ -424,7 +440,15 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         )
         session.add(lead)
         created_leads += 1
+        remaining_lead_capacity -= 1
         existing_lead_biz.add(business.id)
+        if remaining_lead_capacity <= 0:
+            quota_reached = True
+            logger.info(
+                "Discovery reached monthly lead quota campaign=%s created=%s",
+                campaign_id,
+                created_leads,
+            )
 
     campaign.total_leads_found = total_found
     campaign.qualified_leads = created_leads
@@ -439,12 +463,17 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         )
     session.commit()
 
+    note = None
+    if quota_reached:
+        note = "Monthly lead quota reached; discovery stopped at the plan limit."
+
     logger.info(
-        "Discovery done campaign=%s found=%s qualified=%s audited=%s",
+        "Discovery done campaign=%s found=%s qualified=%s audited=%s quota_reached=%s",
         campaign_id,
         total_found,
         created_leads,
         audited,
+        quota_reached,
     )
     return {
         "campaign_id": str(campaign_id),
@@ -452,4 +481,5 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         "qualified": created_leads,
         "website_audits": audited,
         "status": campaign.status,
+        **({"note": note} if note else {}),
     }

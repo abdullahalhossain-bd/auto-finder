@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import get_current_user, CurrentUser
 from app.repositories.lead_repository import LeadRepository
-from app.schemas.lead import LeadRead, LeadList, LeadUpdate
+from app.schemas.lead import LeadRead, LeadList, LeadUpdate, enrich_lead_read
 from app.services.audit_service import write_audit
 from app.schemas.message import MessageGenerateRequest, MessageRead, MessageGenerateQueued
 
@@ -32,7 +32,7 @@ async def list_leads(
     )
     result = []
     for lead in items:
-        data = LeadRead.model_validate(lead)
+        data = enrich_lead_read(lead)
         if lead.business:
             data.business_name = lead.business.name
             data.business_category = lead.business.category
@@ -53,7 +53,7 @@ async def get_lead(
             status_code=404,
             detail={"error": {"code": "NOT_FOUND", "message": "Lead not found"}},
         )
-    data = LeadRead.model_validate(lead)
+    data = enrich_lead_read(lead)
     if lead.business:
         data.business_name = lead.business.name
         data.business_category = lead.business.category
@@ -80,24 +80,17 @@ async def update_lead(
         lead.notes = payload.notes
         await db.commit()
         await db.refresh(lead)
-    return LeadRead.model_validate(lead)
+    return enrich_lead_read(lead)
 
 
-@router.post(
-    "/{lead_id}/messages",
-    status_code=status.HTTP_202_ACCEPTED,
-)
+@router.post("/{lead_id}/messages", status_code=status.HTTP_202_ACCEPTED)
 async def generate_message_for_lead(
     lead_id: UUID,
     payload: MessageGenerateRequest = MessageGenerateRequest(),
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Template + LLM personalization for this lead.
-    Default: enqueue Celery job (202). async_mode=false runs inline and returns MessageRead.
-    Message always lands in pending_approval — never auto-sent.
-    """
+    """Generate a personalized message; it always lands in pending approval."""
     from app.core.sync_db import get_sync_session
     from app.services.message_generation_service import generate_message_for_lead_sync
 
@@ -109,46 +102,31 @@ async def generate_message_for_lead(
             detail={"error": {"code": "NOT_FOUND", "message": "Lead not found"}},
         )
 
-    # AI Auto Message is a paid feature
     from app.services.plan_limits import PaidFeatureRequired, assert_paid_feature
     try:
         await assert_paid_feature(db, current.organization_id, "ai_auto_message")
     except PaidFeatureRequired as exc:
         raise HTTPException(
             status_code=402,
-            detail={
-                "error": {
-                    "code": exc.code,
-                    "message": exc.message,
-                    "feature": exc.feature,
-                }
-            },
+            detail={"error": {"code": exc.code, "message": exc.message, "feature": exc.feature}},
         ) from exc
 
-    # Async (preferred): queue worker
     if payload.async_mode:
         try:
             from app.workers.tasks import generate_message_task
-
             job = generate_message_task.delay(
                 str(lead_id),
                 str(current.organization_id),
                 str(payload.contact_id) if payload.contact_id else None,
                 payload.service_offered,
             )
-            return MessageGenerateQueued(
-                job_id=job.id,
-                status="queued",
-                lead_id=lead_id,
-            )
+            return MessageGenerateQueued(job_id=job.id, status="queued", lead_id=lead_id)
         except Exception:
             import logging
-
             logging.getLogger(__name__).exception(
                 "Celery unavailable — generating message inline for lead %s", lead_id
             )
 
-    # Inline / fallback
     sync = get_sync_session()
     try:
         msg = generate_message_for_lead_sync(
@@ -168,21 +146,10 @@ async def generate_message_for_lead(
         sync.close()
 
 
-# --- Canonical stage machine (API_REFERENCE) ---
-
 ALLOWED_STAGES = {
-    "new",
-    "contacted",
-    "follow_up",
-    "replied",
-    "interested",
-    "won",
-    "lost",
-    "disqualified",
-    "do_not_contact",
+    "new", "contacted", "follow_up", "replied", "interested", "won", "lost", "disqualified", "do_not_contact",
 }
 
-# Simplified allowed transitions (Stage 1)
 STAGE_TRANSITIONS: dict[str, set[str]] = {
     "new": {"contacted", "disqualified", "do_not_contact", "lost"},
     "contacted": {"follow_up", "replied", "interested", "lost", "disqualified", "do_not_contact"},
@@ -203,18 +170,12 @@ async def set_lead_stage(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(get_current_user),
 ):
-    """Canonical stage transition with validation."""
     stage = (payload or {}).get("stage")
     notes = (payload or {}).get("notes")
     if not stage or stage not in ALLOWED_STAGES:
         raise HTTPException(
             status_code=422,
-            detail={
-                "error": {
-                    "code": "INVALID_STAGE",
-                    "message": f"stage must be one of: {sorted(ALLOWED_STAGES)}",
-                }
-            },
+            detail={"error": {"code": "INVALID_STAGE", "message": f"stage must be one of: {sorted(ALLOWED_STAGES)}"}},
         )
     repo = LeadRepository(db)
     lead = await repo.get_by_id(lead_id, current.organization_id)
@@ -228,23 +189,14 @@ async def set_lead_stage(
     if stage != current_stage and stage not in allowed:
         raise HTTPException(
             status_code=409,
-            detail={
-                "error": {
-                    "code": "INVALID_TRANSITION",
-                    "message": f"Cannot move from '{current_stage}' to '{stage}'",
-                }
-            },
+            detail={"error": {"code": "INVALID_TRANSITION", "message": f"Cannot move from '{current_stage}' to '{stage}'"}},
         )
     lead = await repo.update_stage(lead, stage)
     if notes is not None:
         lead.notes = notes
         await db.commit()
         await db.refresh(lead)
-    data = LeadRead.model_validate(lead)
-    if lead.business:
-        data.business_name = lead.business.name
-        data.business_category = lead.business.category
-    return data
+    return enrich_lead_read(lead)
 
 
 @router.post("/{lead_id}/disqualify", response_model=LeadRead)
@@ -254,7 +206,6 @@ async def disqualify_lead(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(get_current_user),
 ):
-    """Mark lead disqualified (terminal). Optional reason stored in notes."""
     repo = LeadRepository(db)
     lead = await repo.get_by_id(lead_id, current.organization_id)
     if not lead:
@@ -268,11 +219,7 @@ async def disqualify_lead(
         lead.notes = ((lead.notes or "") + f"\n[disqualified] {reason}").strip()
         await db.commit()
         await db.refresh(lead)
-    data = LeadRead.model_validate(lead)
-    if lead.business:
-        data.business_name = lead.business.name
-        data.business_category = lead.business.category
-    return data
+    return enrich_lead_read(lead)
 
 
 @router.post("/{lead_id}/do-not-contact", response_model=LeadRead)
@@ -282,13 +229,9 @@ async def do_not_contact_lead(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Terminal stage + suppression side-effect for business phone/email contacts.
-    """
     from sqlalchemy import select
     from app.models.contact import Contact
     from app.models.suppression import SuppressionList
-    from app.models.business import Business
 
     repo = LeadRepository(db)
     lead = await repo.get_by_id(lead_id, current.organization_id)
@@ -301,11 +244,8 @@ async def do_not_contact_lead(
     lead = await repo.update_stage(lead, "do_not_contact")
     reason = (payload or {}).get("reason") or "do_not_contact"
 
-    # Suppress all known contacts on the business
     if lead.business_id:
-        contacts = (
-            await db.execute(select(Contact).where(Contact.business_id == lead.business_id))
-        ).scalars().all()
+        contacts = (await db.execute(select(Contact).where(Contact.business_id == lead.business_id))).scalars().all()
         for c in contacts:
             val = (c.value or "").strip().lower()
             if not val:
@@ -317,14 +257,11 @@ async def do_not_contact_lead(
                 )
             )
             if exists.scalar_one_or_none() is None:
-                db.add(
-                    SuppressionList(
-                        organization_id=current.organization_id,
-                        contact_value=val,
-                        reason=reason,
-                    )
-                )
-        # Also suppress website host? skip — contact values only
+                db.add(SuppressionList(
+                    organization_id=current.organization_id,
+                    contact_value=val,
+                    reason=reason,
+                ))
         biz = lead.business
         if biz and biz.phone:
             ph = biz.phone.strip().lower()
@@ -335,13 +272,11 @@ async def do_not_contact_lead(
                 )
             )
             if exists.scalar_one_or_none() is None:
-                db.add(
-                    SuppressionList(
-                        organization_id=current.organization_id,
-                        contact_value=ph,
-                        reason=reason,
-                    )
-                )
+                db.add(SuppressionList(
+                    organization_id=current.organization_id,
+                    contact_value=ph,
+                    reason=reason,
+                ))
 
     await write_audit(
         db,
@@ -354,8 +289,4 @@ async def do_not_contact_lead(
     )
     await db.commit()
     await db.refresh(lead)
-    data = LeadRead.model_validate(lead)
-    if lead.business:
-        data.business_name = lead.business.name
-        data.business_category = lead.business.category
-    return data
+    return enrich_lead_read(lead)

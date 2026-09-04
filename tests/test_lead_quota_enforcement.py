@@ -50,6 +50,11 @@ def test_starter_and_pro_caps_are_higher():
     assert get_plan_caps("pro")["max_leads_per_month"] == 5000
 
 
-def test_async_guard_matches_sync_guard():
+def test_async_guard_blocks_over_cap():
     session = FakeAsyncSession("starter")
-    asyncio.run(_assert_lead_increment_allowed_async(session, uuid4(), 500, 1))
+    try:
+        asyncio.run(_assert_lead_increment_allowed_async(session, uuid4(), 500, 1))
+    except PlanLimitExceeded as exc:
+        assert exc.code == "LEAD_CAP_REACHED"
+    else:
+        raise AssertionError("Expected LEAD_CAP_REACHED")

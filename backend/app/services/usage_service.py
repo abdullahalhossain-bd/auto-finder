@@ -39,6 +39,33 @@ def _bump(row: Usage, counter: CounterName, amount: int) -> None:
     setattr(row, counter, int(getattr(row, counter) or 0) + amount)
 
 
+def get_remaining_lead_capacity_sync(
+    session: Session,
+    organization_id: UUID,
+    *,
+    period: Optional[str] = None,
+) -> int:
+    """Return the number of lead writes still available for this org/month."""
+    period = period or current_period()
+    org = session.get(Organization, organization_id)
+    if org is None:
+        raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
+    plan = normalize_plan(org.plan)
+    cap = int(get_plan_caps(plan)["max_leads_per_month"])
+    row = (
+        session.execute(
+            select(Usage).where(
+                Usage.organization_id == organization_id,
+                Usage.period == period,
+            )
+        )
+        .scalars()
+        .first()
+    )
+    used = int(row.leads_count or 0) if row else 0
+    return max(0, cap - used)
+
+
 def _assert_lead_increment_allowed_sync(
     session: Session,
     organization_id: UUID,

@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.business import Business
@@ -27,7 +26,7 @@ from app.services.discovery_service import DiscoveryService
 from app.services.places_provider import GooglePlacesProvider, match_places_to_osm
 from app.services.scoring_service import ScoringService
 from app.services.website_intelligence import analyze_website_sync
-from app.services.usage_service import get_remaining_lead_capacity_sync
+from app.services.usage_service import acquire_lead_quota_lock_sync, get_remaining_lead_capacity_sync
 
 logger = logging.getLogger(__name__)
 
@@ -152,12 +151,18 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     audited = 0
     total_found = len(candidates)
     quota_reached = False
-    remaining_lead_capacity = get_remaining_lead_capacity_sync(session, campaign.organization_id)
+
+    # The lock is transaction-scoped. It is acquired only after all network
+    # discovery work is finished, then held through the quota check and final
+    # commit. Concurrent campaigns for the same organization therefore cannot
+    # both reserve the same rolling-24h free quota slots.
     campaign.status = "scoring"
     session.commit()
+    acquire_lead_quota_lock_sync(session, campaign.organization_id)
+    remaining_lead_capacity = get_remaining_lead_capacity_sync(session, campaign.organization_id)
     if remaining_lead_capacity <= 0:
         quota_reached = True
-        logger.info("Discovery skipped: free/trial rolling 24-hour lead quota already reached campaign=%s", campaign_id)
+        logger.info("Discovery skipped: rolling 24-hour lead quota already reached campaign=%s", campaign_id)
     for raw in candidates:
         if quota_reached:
             break

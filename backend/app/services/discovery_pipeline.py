@@ -219,6 +219,6 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     session.commit()
     note = None
     if quota_reached:
-        note = "Free/trial rolling 24-hour lead quota reached; discovery stopped at the plan limit." if normalize_plan(campaign.organization_id) == "trial" else "Monthly lead quota reached; discovery stopped at the plan limit."
+        note = "Lead quota reached; discovery stopped at the plan limit."
     logger.info("Discovery done campaign=%s found=%s qualified=%s audited=%s quota_reached=%s", campaign_id, total_found, created_leads, audited, quota_reached)
     return {"campaign_id": str(campaign_id), "total_found": total_found, "qualified": created_leads, "website_audits": audited, "status": campaign.status, **({"note": note} if note else {})}

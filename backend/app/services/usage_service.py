@@ -2,16 +2,16 @@
 Monthly usage counters write-path (usage table).
 
 Free stack only — Postgres row upsert, no paid analytics.
-Lead quota is enforced again at this write boundary so discovery workers
-cannot commit more leads than the organization's plan allows.
+Lead quota is enforced at this write boundary so discovery workers cannot
+commit more leads than the organization's plan allows.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -39,19 +39,62 @@ def _bump(row: Usage, counter: CounterName, amount: int) -> None:
     setattr(row, counter, int(getattr(row, counter) or 0) + amount)
 
 
+def _trial_leads_used_sync(session: Session, organization_id: UUID) -> int:
+    from app.models.campaign import Campaign
+    from app.models.lead import Lead
+
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    return int(
+        session.execute(
+            select(func.count())
+            .select_from(Lead)
+            .join(Campaign, Lead.campaign_id == Campaign.id)
+            .where(
+                Campaign.organization_id == organization_id,
+                Lead.created_at >= since,
+            )
+        ).scalar_one()
+    )
+
+
+async def _trial_leads_used_async(session: AsyncSession, organization_id: UUID) -> int:
+    from app.models.campaign import Campaign
+    from app.models.lead import Lead
+
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Lead)
+                .join(Campaign, Lead.campaign_id == Campaign.id)
+                .where(
+                    Campaign.organization_id == organization_id,
+                    Lead.created_at >= since,
+                )
+            )
+        ).scalar_one()
+    )
+
+
 def get_remaining_lead_capacity_sync(
     session: Session,
     organization_id: UUID,
     *,
     period: Optional[str] = None,
 ) -> int:
-    """Return the number of lead writes still available for this org/month."""
-    period = period or current_period()
+    """Return remaining lead capacity; free/trial uses a rolling 24-hour window."""
     org = session.get(Organization, organization_id)
     if org is None:
         raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
+
     plan = normalize_plan(org.plan)
-    cap = int(get_plan_caps(plan)["max_leads_per_month"])
+    caps = get_plan_caps(plan)
+    if plan == "trial":
+        used = _trial_leads_used_sync(session, organization_id)
+        return max(0, int(caps["max_leads_per_24h"]) - used)
+
+    period = period or current_period()
     row = (
         session.execute(
             select(Usage).where(
@@ -63,7 +106,7 @@ def get_remaining_lead_capacity_sync(
         .first()
     )
     used = int(row.leads_count or 0) if row else 0
-    return max(0, cap - used)
+    return max(0, int(caps["max_leads_per_month"]) - used)
 
 
 def _assert_lead_increment_allowed_sync(
@@ -78,12 +121,19 @@ def _assert_lead_increment_allowed_sync(
     if org is None:
         raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
     plan = normalize_plan(org.plan)
-    cap = int(get_plan_caps(plan)["max_leads_per_month"])
+    caps = get_plan_caps(plan)
+    if plan == "trial":
+        used = _trial_leads_used_sync(session, organization_id)
+        cap = int(caps["max_leads_per_24h"])
+        if used + amount > cap:
+            raise PlanLimitExceeded(
+                "LEAD_CAP_REACHED",
+                f"Your free plan allows {cap} leads every 24 hours. Please wait until your rolling 24-hour quota resets or upgrade.",
+            )
+        return
+    cap = int(caps["max_leads_per_month"])
     if current_count + amount > cap:
-        raise PlanLimitExceeded(
-            "LEAD_CAP_REACHED",
-            f"Your {plan} plan allows {cap} leads per month.",
-        )
+        raise PlanLimitExceeded("LEAD_CAP_REACHED", f"Your {plan} plan allows {cap} leads per month.")
 
 
 async def _assert_lead_increment_allowed_async(
@@ -98,12 +148,19 @@ async def _assert_lead_increment_allowed_async(
     if org is None:
         raise PlanLimitExceeded("ORG_NOT_FOUND", "Organization not found")
     plan = normalize_plan(org.plan)
-    cap = int(get_plan_caps(plan)["max_leads_per_month"])
+    caps = get_plan_caps(plan)
+    if plan == "trial":
+        used = await _trial_leads_used_async(session, organization_id)
+        cap = int(caps["max_leads_per_24h"])
+        if used + amount > cap:
+            raise PlanLimitExceeded(
+                "LEAD_CAP_REACHED",
+                f"Your free plan allows {cap} leads every 24 hours. Please wait until your rolling 24-hour quota resets or upgrade.",
+            )
+        return
+    cap = int(caps["max_leads_per_month"])
     if current_count + amount > cap:
-        raise PlanLimitExceeded(
-            "LEAD_CAP_REACHED",
-            f"Your {plan} plan allows {cap} leads per month.",
-        )
+        raise PlanLimitExceeded("LEAD_CAP_REACHED", f"Your {plan} plan allows {cap} leads per month.")
 
 
 async def increment_usage_async(

@@ -8,11 +8,12 @@ monthly usage-counter enforcement at this write boundary.
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,24 @@ def current_period(now: Optional[datetime] = None) -> str:
 
 def _bump(row: Usage, counter: CounterName, amount: int) -> None:
     setattr(row, counter, int(getattr(row, counter) or 0) + amount)
+
+
+def _organization_advisory_lock_key(organization_id: UUID) -> int:
+    """Stable signed 64-bit PostgreSQL advisory-lock key for an organization."""
+    digest = hashlib.blake2b(str(organization_id).encode("ascii"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def acquire_lead_quota_lock_sync(session: Session, organization_id: UUID) -> None:
+    """Serialize lead-quota check + lead inserts for one organization.
+
+    The lock is transaction-scoped and therefore releases automatically on
+    commit/rollback. It intentionally lives in the same transaction as the
+    discovery lead inserts, preventing two concurrent workers from both seeing
+    the same remaining rolling-24h capacity and exceeding the free quota.
+    """
+    key = _organization_advisory_lock_key(organization_id)
+    session.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": key})
 
 
 def _trial_leads_used_sync(session: Session, organization_id: UUID) -> int:

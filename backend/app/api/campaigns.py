@@ -21,7 +21,7 @@ async def create_campaign(
 ):
     try:
         await assert_can_create_campaign(db, current.organization_id)
-        # Free plan: hard 40-lead monthly cap before starting generation
+        # Prevent starting a campaign when monthly lead quota is already exhausted.
         await assert_lead_capacity(db, current.organization_id, additional=1)
     except PlanLimitExceeded as exc:
         raise HTTPException(

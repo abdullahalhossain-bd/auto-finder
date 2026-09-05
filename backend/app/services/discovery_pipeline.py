@@ -39,6 +39,14 @@ def _analyze_website_sync(url: str) -> Dict[str, Any]:
     return analyze_website_sync(url)
 
 
+def _campaign_is_cancelled(session: Session, campaign_id: UUID) -> bool:
+    """Read cancellation state from the database, not a stale ORM instance."""
+    status = session.execute(
+        select(Campaign.status).where(Campaign.id == campaign_id)
+    ).scalar_one_or_none()
+    return status == "cancelled"
+
+
 def _collect_candidates(*, city: str, business_type: str, country: Optional[str], limit: int, places_api_key: Optional[str] = None) -> List[Dict[str, Any]]:
     """OSM seed + optional Places enrichment, then in-memory dedupe."""
     from app.demo.adapters import is_demo_mode
@@ -138,12 +146,22 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         campaign.status = "failed"
         session.commit()
         return {"error": str(exc), "campaign_id": str(campaign_id)}
+
+    # A cancellation can arrive while external discovery providers are running.
+    # Check again before doing any writes derived from those results.
+    if _campaign_is_cancelled(session, campaign_id):
+        logger.info("Discovery cancelled after candidate collection campaign=%s", campaign_id)
+        return {"campaign_id": str(campaign_id), "status": "cancelled", "note": "Campaign cancelled before scoring."}
+
     if not candidates:
-        campaign.total_leads_found = 0
-        campaign.qualified_leads = 0
-        campaign.status = "ready_for_review"
-        session.commit()
-        return {"campaign_id": str(campaign_id), "total_found": 0, "qualified": 0, "note": "No businesses found (OSM sparse and Places disabled/empty)", "status": campaign.status}
+        campaign = session.get(Campaign, campaign_id)
+        if campaign and campaign.status != "cancelled":
+            campaign.total_leads_found = 0
+            campaign.qualified_leads = 0
+            campaign.status = "ready_for_review"
+            session.commit()
+        return {"campaign_id": str(campaign_id), "total_found": 0, "qualified": 0, "note": "No businesses found (OSM sparse and Places disabled/empty)", "status": "cancelled" if _campaign_is_cancelled(session, campaign_id) else "ready_for_review"}
+
     existing_lead_biz = {row[0] for row in session.execute(select(Lead.business_id).where(Lead.campaign_id == campaign_id)).all()}
     filters = params.get("filters") or {}
     scorer = ScoringService()
@@ -151,11 +169,13 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     audited = 0
     total_found = len(candidates)
     quota_reached = False
+    cancelled = False
 
-    # The lock is transaction-scoped. It is acquired only after all network
-    # discovery work is finished, then held through the quota check and final
-    # commit. Concurrent campaigns for the same organization therefore cannot
-    # both reserve the same rolling-24h free quota slots.
+    campaign = session.get(Campaign, campaign_id)
+    if campaign is None:
+        return {"error": "campaign_not_found", "campaign_id": str(campaign_id)}
+    if campaign.status == "cancelled":
+        return {"campaign_id": str(campaign_id), "status": "cancelled"}
     campaign.status = "scoring"
     session.commit()
     acquire_lead_quota_lock_sync(session, campaign.organization_id)
@@ -163,13 +183,20 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
     if remaining_lead_capacity <= 0:
         quota_reached = True
         logger.info("Discovery skipped: rolling 24-hour lead quota already reached campaign=%s", campaign_id)
+
     for raw in candidates:
+        # Always query the current DB state. The previous implementation checked
+        # campaign.status on a stale ORM object and could miss an external cancel.
+        if _campaign_is_cancelled(session, campaign_id):
+            cancelled = True
+            logger.info("Discovery cancellation detected campaign=%s created=%s", campaign_id, created_leads)
+            break
         if quota_reached:
             break
-        if campaign.status == "cancelled":
-            session.refresh(campaign)
-            if campaign.status == "cancelled":
-                break
+        campaign = session.get(Campaign, campaign_id)
+        if campaign is None:
+            cancelled = True
+            break
         business = _upsert_business(session, organization_id=campaign.organization_id, raw=raw)
         if business.id in existing_lead_biz:
             continue
@@ -215,6 +242,24 @@ def run_discovery_pipeline_sync(session: Session, campaign_id: UUID) -> Dict[str
         if remaining_lead_capacity <= 0:
             quota_reached = True
             logger.info("Discovery reached lead quota campaign=%s created=%s", campaign_id, created_leads)
+
+    # Cancellation wins over normal completion. Do not mark a cancelled job as
+    # ready_for_review, and preserve any successfully accumulated leads.
+    campaign = session.get(Campaign, campaign_id)
+    if campaign is None:
+        session.rollback()
+        return {"error": "campaign_not_found", "campaign_id": str(campaign_id)}
+    if cancelled or campaign.status == "cancelled" or _campaign_is_cancelled(session, campaign_id):
+        campaign.status = "cancelled"
+        campaign.total_leads_found = total_found
+        campaign.qualified_leads = created_leads
+        if created_leads > 0:
+            from app.services.usage_service import increment_usage_sync
+            increment_usage_sync(session, campaign.organization_id, "leads_count", amount=created_leads)
+        session.commit()
+        logger.info("Discovery cancelled campaign=%s found=%s qualified=%s audited=%s", campaign_id, total_found, created_leads, audited)
+        return {"campaign_id": str(campaign_id), "total_found": total_found, "qualified": created_leads, "website_audits": audited, "status": "cancelled", "note": "Campaign cancelled; partial results preserved."}
+
     campaign.total_leads_found = total_found
     campaign.qualified_leads = created_leads
     campaign.status = "ready_for_review"

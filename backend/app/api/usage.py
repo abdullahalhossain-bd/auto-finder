@@ -1,5 +1,5 @@
-"""GET /usage — plan caps vs current month (live counts + materialised usage row)."""
-from datetime import datetime, timezone
+"""GET /usage — plan caps and live usage."""
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
@@ -18,9 +18,7 @@ from app.services.plan_limits import (
     has_feature,
     is_paid_plan,
     normalize_plan,
-    score_tier,
 )
-from app.services.subscription_service import SubscriptionService
 from app.services.usage_service import current_period, get_usage_row_async
 
 router = APIRouter(tags=["usage"])
@@ -31,15 +29,19 @@ def _month_start() -> datetime:
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
+def _rolling_24h_start() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=24)
+
+
 @router.get("/usage")
 async def get_usage(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(get_current_user),
 ):
     org = await db.get(Organization, current.organization_id)
-    plan = normalize_plan(org.plan if org else "free")
+    plan = normalize_plan(org.plan if org else "trial")
     caps = get_plan_caps(plan)
-    since = _month_start()
+    month_start = _month_start()
     period = current_period()
 
     campaigns = (
@@ -48,22 +50,69 @@ async def get_usage(
             .select_from(Campaign)
             .where(
                 Campaign.organization_id == current.organization_id,
-                Campaign.created_at >= since,
+                Campaign.created_at >= month_start,
             )
         )
     ).scalar_one()
 
-    leads = (
+    sub = (
         await db.execute(
-            select(func.count())
-            .select_from(Lead)
-            .join(Campaign, Lead.campaign_id == Campaign.id)
-            .where(
-                Campaign.organization_id == current.organization_id,
-                Lead.created_at >= since,
-            )
+            select(Subscription).where(Subscription.organization_id == current.organization_id)
         )
-    ).scalar_one()
+    ).scalar_one_or_none()
+    sub_status = sub.status if sub else "trialing"
+    paid = is_paid_plan(plan, sub_status)
+
+    # Trial/free lead usage is a rolling 24-hour window. Paid plans remain monthly.
+    if plan == "trial":
+        quota_start = _rolling_24h_start()
+        leads = (
+            await db.execute(
+                select(func.count())
+                .select_from(Lead)
+                .join(Campaign, Lead.campaign_id == Campaign.id)
+                .where(
+                    Campaign.organization_id == current.organization_id,
+                    Lead.created_at >= quota_start,
+                )
+            )
+        ).scalar_one()
+        lead_limit = int(caps["max_leads_per_24h"])
+        quota_window = "rolling_24h"
+
+        # When exhausted, tell the UI exactly when the oldest counted lead
+        # leaves the rolling window. Otherwise there is no single reset time.
+        oldest_recent = (
+            await db.execute(
+                select(func.min(Lead.created_at))
+                .select_from(Lead)
+                .join(Campaign, Lead.campaign_id == Campaign.id)
+                .where(
+                    Campaign.organization_id == current.organization_id,
+                    Lead.created_at >= quota_start,
+                )
+            )
+        ).scalar_one_or_none()
+        quota_resets_at = (
+            (oldest_recent + timedelta(hours=24)).isoformat()
+            if int(leads) >= lead_limit and oldest_recent is not None
+            else None
+        )
+    else:
+        leads = (
+            await db.execute(
+                select(func.count())
+                .select_from(Lead)
+                .join(Campaign, Lead.campaign_id == Campaign.id)
+                .where(
+                    Campaign.organization_id == current.organization_id,
+                    Lead.created_at >= month_start,
+                )
+            )
+        ).scalar_one()
+        lead_limit = int(caps["max_leads_per_month"])
+        quota_window = "monthly"
+        quota_resets_at = None
 
     messages_sent = (
         await db.execute(
@@ -74,16 +123,10 @@ async def get_usage(
             .where(
                 Campaign.organization_id == current.organization_id,
                 Message.status == "sent",
-                Message.sent_at >= since,
+                Message.sent_at >= month_start,
             )
         )
     ).scalar_one()
-
-    sub = (
-        await db.execute(
-            select(Subscription).where(Subscription.organization_id == current.organization_id)
-        )
-    ).scalar_one_or_none()
 
     materialised = await get_usage_row_async(db, current.organization_id, period)
     counters = {
@@ -94,30 +137,32 @@ async def get_usage(
     }
 
     leads_i = int(leads)
-    lead_limit = int(caps["max_leads_per_month"])
     lead_remaining = max(0, lead_limit - leads_i)
     lead_percent = round((leads_i / lead_limit) * 100, 1) if lead_limit else 0.0
-    sub_status = sub.status if sub else "trialing"
-    paid = is_paid_plan(plan, sub_status)
 
     return {
         "plan": plan,
         "subscription_status": sub_status,
         "is_paid": paid,
         "period": period,
-        "period_start": since.isoformat(),
+        "period_start": month_start.isoformat(),
         "usage": {
             "campaigns": int(campaigns),
             "leads": leads_i,
             "messages_sent": int(messages_sent),
             "llm_calls": counters["llm_calls_count"] or 0,
         },
-        # Explicit quota UX fields (do not confuse with generation progress)
         "leads_used": leads_i,
         "leads_limit": lead_limit,
         "leads_remaining": lead_remaining,
+        "leads_quota_window": quota_window,
+        "quota_resets_at": quota_resets_at,
         "percent_used": lead_percent,
-        "quota_label": f"{leads_i} / {lead_limit} Leads Used",
+        "quota_label": (
+            f"{leads_i} / {lead_limit} Leads Used"
+            if quota_window == "monthly"
+            else f"{leads_i} / {lead_limit} Leads Used (24h)"
+        ),
         "materialised": counters,
         "caps": caps,
         "remaining": {

@@ -13,17 +13,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install deps
+      - name: Install backend deps
         run: |
           pip install -r backend/requirements.txt
       - name: Unit tests (no Postgres)
-        working-directory: .
         env:
           PYTHONPATH: backend
         run: |
           pytest -q --noconftest \
             tests/test_dedupe.py \
             tests/test_scoring.py \
+            tests/test_lead_quota_enforcement.py \
             backend/tests/test_website_intelligence.py \
             backend/tests/test_lead_api_data_flow.py \
             tests/test_esp_unsubscribe.py \
@@ -37,8 +37,21 @@ jobs:
             tests/test_billing_plan_status.py \
             tests/test_dns_verify.py
 
-  # Optional full suite when secrets/services are available
-  # integration:
-  #   runs-on: ubuntu-latest
-  #   services:
-  #     postgres: ...
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+      - name: Typecheck and production build
+        working-directory: frontend
+        run: npm run build
+
+  # Optional full integration suite when external services are available.
+  # Add Postgres/Redis service containers here before enabling.

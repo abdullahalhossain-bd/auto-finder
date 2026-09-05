@@ -1,90 +1,117 @@
 # AI Sales Agent for Local Businesses
 
-**Stage 1: Local Business Opportunity Finder + Safe Outreach Assistant**
+**Stage 1 — Local Business Opportunity Finder + Safe Outreach Assistant**
 
-Find local businesses that need websites or online booking systems and help freelancers & small agencies reach them safely with personalized outreach.
+Find local businesses that may need better websites or online booking and help freelancers and small agencies research, qualify, personalize, and safely prepare outreach.
 
-## Current Status: Stage 1 Core Complete
+## Current status
 
-### What works now
-- Auth (Register / Login / JWT)
-- Organizations & Memberships
-- Campaign creation with Natural Language parsing
-- Business Discovery (OpenStreetMap / Overpass)
-- Deterministic Website Analysis
-- Rule-based Opportunity Scoring
-- Confidence states (Verified / Likely / Unknown / Not Found)
-- Lead management + Pipeline stages
-- Message generation + **Mandatory Human Approval** queue
-- Suppression / Do Not Contact list
-- Full API under `/api/v1`
+The Stage 1 core is implemented with production-oriented safety controls and CI coverage.
 
-### Safety rules enforced
-- No automatic email sending
-- Human approval required before any send
-- Suppression list checked before send
-- Contact Found ≠ Consent to Contact
-- LLM never decides Opportunity Score
+### Working capabilities
+- JWT authentication, organizations, memberships, invites, password reset
+- Natural-language campaign creation and structured campaign parameters
+- OpenStreetMap / Overpass discovery with optional Google Places enrichment
+- Strong business deduplication and organization isolation
+- Deterministic Website Intelligence: mobile readiness, HTTPS, SEO, CTA, contact, booking, CMS, analytics, social and quality signals
+- Rule-based Opportunity Scoring with stable score tiers
+- Lead management, pipeline stages, disqualification and suppression / Do Not Contact
+- AI-assisted message generation with mandatory human approval
+- Safe outbound path with send-time subscription, identity, suppression, unsubscribe and volume-cap checks
+- Database row locking to prevent concurrent duplicate sends for the same approved message
+- Free/trial lead quota: **25 leads per rolling 24 hours**
+- Concurrent discovery quota protection using PostgreSQL transaction-scoped advisory locks
+- Live usage API with quota window and reset metadata
+- Liveness and database/Redis readiness health endpoints
+- Production configuration validation for secrets, public URL and CORS
+- Frontend production build verified in GitHub Actions
 
-## Tech Stack
+## Safety rules
+
+- No automatic outreach without human approval.
+- Suppression is re-checked immediately before send.
+- Contact found does not imply consent to contact.
+- Opportunity Score is deterministic; the LLM does not control qualification.
+- Sending requires a verified sending identity and active subscription/trial.
+- Daily and weekly organization send caps are enforced server-side.
+
+## Tech stack
+
 - Python 3.11+ / FastAPI / SQLAlchemy 2 / Alembic
 - PostgreSQL + Redis
-- Celery (workers ready)
-- Ollama (local LLM)
-- React + TypeScript frontend (structure ready)
+- Celery workers + retry policy
+- Ollama / remote OpenAI-compatible LLM gateway
+- React + TypeScript + Vite + Tailwind
+- Stripe billing integration
 
-## Quick Start
+## Local development
 
 ```bash
-# 1. Start infrastructure
-docker-compose up -d postgres redis
+docker compose up -d db redis
 
-# 2. Backend
 cd backend
 python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+# Windows: venv\Scripts\activate
+# macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Environment
-cp ../.env.example ../.env
-# Edit .env with your APP_SECRET_KEY and DATABASE_URL
-
-# 4. Migrate
 cd ..
+# Copy .env.example to .env and set APP_SECRET_KEY + DATABASE_URL
 alembic upgrade head
 
-# 5. Run API
 cd backend
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API docs: http://localhost:8000/docs
+Run the frontend separately:
 
-## Project Structure
+```bash
+cd frontend
+npm ci
+npm run dev
 ```
+
+API docs: `http://localhost:8000/docs`
+
+Health: `http://localhost:8000/health`
+
+Readiness: `http://localhost:8000/health/ready`
+
+## Project structure
+
+```text
 ai-sales-agent/
 ├── backend/app/
-│   ├── api/          # Auth, Campaigns, Leads, Messages, Suppression
-│   ├── models/       # All Stage 1 tables
-│   ├── schemas/      # Pydantic models
+│   ├── api/          # Auth, campaigns, leads, billing, outreach, etc.
+│   ├── models/       # PostgreSQL data model
+│   ├── schemas/      # Pydantic request/response schemas
 │   ├── repositories/ # Data access
-│   ├── services/     # Business logic (Discovery, Scoring, LLM, NL Parser)
+│   ├── services/     # Discovery, intelligence, scoring, LLM, billing, outreach
 │   ├── workers/      # Celery tasks
-│   └── core/         # Config, security, database
-├── docs/             # Full product & technical specs
-├── frontend/         # React app (starter)
-├── alembic/          # Migrations
-└── tests/
+│   └── core/         # Config, security, database, logging
+├── frontend/         # React + TypeScript application
+├── alembic/          # Database migrations
+├── docs/             # Product, architecture, UI and roadmap documentation
+└── tests/            # Automated regression tests
 ```
 
-## Documentation
-See `/docs` folder for complete Product Spec, Architecture, Features, UI Pages, Coding Rules, and Roadmap.
+## CI
 
-## Next Phases
-- Phase 2: Better website intelligence + more signals
-- Phase 3: Full Ollama/Groq personalization polish
-- Phase 4: ESP integration (Resend/Postmark) + real sending after approval
-- Phase 5: Frontend complete + closed beta
+GitHub Actions runs:
+
+1. Backend unit/regression tests without external services.
+2. Frontend TypeScript typecheck + production build.
+
+A separate integration environment with PostgreSQL/Redis should be used before enabling real outbound email in production.
+
+## Next production-hardening milestones
+
+- PostgreSQL integration/concurrency test suite in CI
+- Stronger discovery cancellation checks and job-state observability
+- Production ESP verification (SPF/DKIM), bounce/complaint processing and webhook monitoring
+- End-to-end staging test: signup → campaign → discovery → lead intelligence → message → approval → safe send
+- Production deployment, backups, monitoring and rollback runbook
 
 ## License
+
 Private — All rights reserved

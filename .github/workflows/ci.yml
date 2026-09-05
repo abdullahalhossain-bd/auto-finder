@@ -19,6 +19,8 @@ jobs:
       - name: Unit tests (no Postgres)
         env:
           PYTHONPATH: backend
+          APP_SECRET_KEY: ci-test-secret
+          DATABASE_URL: sqlite+aiosqlite:///./ci-test.db
         run: |
           pytest -q --noconftest \
             tests/test_dedupe.py \

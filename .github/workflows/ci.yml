@@ -25,6 +25,7 @@ jobs:
             tests/test_dedupe.py \
             tests/test_scoring.py \
             tests/test_lead_quota_enforcement.py \
+            tests/test_discovery_cancellation.py \
             backend/tests/test_website_intelligence.py \
             backend/tests/test_lead_api_data_flow.py \
             tests/test_esp_unsubscribe.py \
